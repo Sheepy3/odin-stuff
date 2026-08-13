@@ -1,11 +1,14 @@
+#include <windows.h>
+#include <GL/gl.h>
+
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
+
 #include <iostream>
 
 struct Simulation {
     float   *d_Velo_Potential_Data;
     uint8_t *d_Solid_Data;
-    uchar4 *d_Pixels;
     uchar4 *d_Palette;
     cudaGraphicsResource* display_texture_resource; // the visualization texture
     int length;
@@ -25,7 +28,7 @@ __global__ void iteration_kernel( //defines the kernel. cannot pass sim into thi
 __global__ void pixel_color_kernel(
     float *Velo_Potential_Data,
     const uint8_t *Solid_Data,
-    uchar4 *Pixels,
+    cudaSurfaceObject_t surface,
     uchar4 *Palette,
     int length,
     int width,
@@ -41,7 +44,7 @@ Simulation* cuda_allocate_mem(
     float *Velo_Potential_Data,
     const uint8_t *Solid_Data,
     unsigned int texture_id,
-    uchar4 *pallette,
+    uchar4 *palette,
     int width,
     int height
 );
@@ -70,7 +73,7 @@ Simulation* cuda_allocate_mem(
     float *Velo_Potential_Data,
     const uint8_t *Solid_Data,
     unsigned int texture_id,
-    uchar4 *pallette,
+    uchar4 *palette,
     int width,
     int height
 ){
@@ -105,7 +108,7 @@ Simulation* cuda_allocate_mem(
         cudaFree(sim->d_Palette);
         return nullptr;
     }
-    if (check_cuda_error(cudaMemcpy(sim->d_Palette,pallette,512*sizeof(uchar4),cudaMemcpyHostToDevice), "cudaMemcpy d_palette")) {
+    if (check_cuda_error(cudaMemcpy(sim->d_Palette,palette,512*sizeof(uchar4),cudaMemcpyHostToDevice), "cudaMemcpy d_palette")) {
         cudaFree(sim->d_Velo_Potential_Data);
         cudaFree(sim->d_Solid_Data);
         cudaFree(sim->d_Palette);
@@ -144,7 +147,6 @@ int cuda_iterate(
     int length = sim->length;
     size_t velo_size = sim->length * sizeof(float);
     uchar4 *d_Palette = sim->d_Palette;
-    uchar4 *d_Pixels = sim->d_Pixels;
     
     for (int i =0; i<iterations; i++){
         iteration_kernel<<<block_count,threads_per_block>>>(d_Velo_Potential_Data,d_Solid_Data,length,sim->width,sim->height,0);
@@ -155,13 +157,38 @@ int cuda_iterate(
         return -1;
     }
     
-    pixel_color_kernel<<<block_count,threads_per_block>>>(d_Velo_Potential_Data,d_Solid_Data,d_Pixels,d_Palette,length,sim->width,sim->height);
+    /* Graphics handling */
+    if (check_cuda_error(cudaGraphicsMapResources(1, &sim->display_texture_resource), "cudaGraphicsMapResources")) {
+        return -1;
+    }
+
+    cudaArray_t texture_array;
+    cudaGraphicsSubResourceGetMappedArray(
+        &texture_array, sim->display_texture_resource, 0, 0
+    );
+
+    cudaResourceDesc desc{};
+    desc.resType = cudaResourceTypeArray;
+    desc.res.array.array = texture_array;
+
+    cudaSurfaceObject_t surface;
+    cudaCreateSurfaceObject(&surface, &desc);
+
+    pixel_color_kernel<<<block_count,threads_per_block>>>(d_Velo_Potential_Data,d_Solid_Data,surface,d_Palette,length,sim->width,sim->height);
 
     if (check_cuda_error(cudaGetLastError(), "cudaGetLastError")) {
         return -1;
     }
 
     if (check_cuda_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize")) {
+        return -1;
+    }
+
+    if (check_cuda_error(cudaDestroySurfaceObject(surface), "cudaDestroySurfaceObject")) { //wait for sync before deleting
+        return -1;
+    }
+
+    if (check_cuda_error(cudaGraphicsUnmapResources(1, &sim->display_texture_resource), "cudaGraphicsUnmapResources")) {
         return -1;
     }
 
@@ -184,10 +211,10 @@ int cuda_free_data(
     if (check_cuda_error(cudaFree(sim->d_Solid_Data), "cudaFree d_Solid_Data")) {
         return -1;
     }
-    if (check_cuda_error(cudaFree(sim->d_Pixels), "cudaFree d_pixels")) {
+    if (check_cuda_error(cudaFree(sim->d_Palette), "cudaFree d_palette")) {
         return -1;
     }
-    if (check_cuda_error(cudaFree(sim->d_Palette), "cudaFree d_palette")) {
+    if (check_cuda_error(cudaGraphicsUnregisterResource(sim->display_texture_resource), "cudaGraphicsUnregisterResource")) {
         return -1;
     }
     delete sim;
@@ -250,7 +277,7 @@ __global__ void iteration_kernel( //defines the kernel
 __global__ void pixel_color_kernel(
     float *Velo_Potential_Data,
     const uint8_t *Solid_Data,
-    uchar4 *Pixels,
+    cudaSurfaceObject_t surface,
     uchar4 *Palette,
     int length,
     int width,
@@ -267,12 +294,22 @@ __global__ void pixel_color_kernel(
     if (index < 0 || index >= length) {
         return;
     }
-
+    
+    uchar4 color;
+    
     if (Solid_Data[index] == 1) {
-        Pixels[index] = uchar4{255, 255, 255, 255}; // white for solid cells
-        return;
+        color = uchar4{255, 255, 255, 255}; // white for solid cells
+    }else{
+        color = rgb_from_potential(Velo_Potential_Data[index], Palette);
     }
-    Pixels[index] = rgb_from_potential(Velo_Potential_Data[index], Palette);
+
+    surf2Dwrite(
+        color,
+        surface,
+        x * sizeof(uchar4), // byte offset, not pixel number
+        y
+    );
+
 }
 
 __device__ int index_from_coords(int x, int y, int width){
@@ -280,9 +317,10 @@ __device__ int index_from_coords(int x, int y, int width){
 }
 
 __device__ uchar4 rgb_from_potential(float potential, uchar4 *palette){
-    int palette_index = static_cast<int>(potential*511.0);
+    float potential_clamped = fminf(fmaxf(potential, 0.0f), 1.0f); // Clamp potential to [0, 1]
+    int palette_index = static_cast<int>(potential_clamped*511.0);
     return palette[palette_index];
 }
 
-//compiled with:
+//ccompiled with:
 // nvcc -arch=sm_86 --shared cuda_solver.cu -o cuda_solver.dll -Xlinker /IMPLIB:cuda_solver.lib

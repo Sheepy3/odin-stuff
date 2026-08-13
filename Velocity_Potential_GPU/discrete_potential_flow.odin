@@ -23,7 +23,7 @@ SCREEN_WIDTH  :: 860
 SCREEN_HEIGHT :: 480
 PIXEL_X_COUNT :: 1000
 PIXEL_Y_COUNT :: 1000
-ITERATIONS_PER_FRAME :: 2000
+ITERATIONS_PER_FRAME :: 1000
 
 
 
@@ -36,6 +36,8 @@ foreign cuda_solver {
     cuda_allocate_mem :: proc(
 		Velo_Potential_Data: ^f32,
 		Solid_Data: ^u8,
+		Texture_id: u32,
+		Palette: ^[4]u8,
         width: i32,
 		height: i32
     ) -> rawptr --- //odin never touches the sim struct, so we can just pass its pointer around without caring about its internals
@@ -68,46 +70,68 @@ main :: proc() {
 		}
 	}
 
-	// //cylinder obstacle (to left)
-	// radius := 200
-	// center_x := (PIXEL_X_COUNT / 2) + 100
-	// center_y := PIXEL_Y_COUNT / 2
-	// for x in 0..<PIXEL_X_COUNT {
-	// 	for y in 0..<PIXEL_Y_COUNT {
-	// 		dx := x - center_x
-	// 		dy := y - center_y
-	// 		if dx*dx + dy*dy <= radius*radius {
-	// 			set_velocity_potential(x, y, 0.0)
-	// 			set_solid(x,y)
-	// 		}
-	// 	}
-	// }
-
-	//centralized square obstacle
-	obstacle_size := 400
-	center_x2 := (PIXEL_X_COUNT / 2) - 100
-	center_y2 := PIXEL_Y_COUNT / 2
-	for x2 in (center_x2 - obstacle_size/2)..<(center_x2 + obstacle_size/2) {
-		for y2 in (center_y2 - obstacle_size/2)..<(center_y2 + obstacle_size/2) {
-			set_velocity_potential(x2,y2,0.0)
-			set_solid(x2,y2)
+	//cylinder obstacle (to left)
+	radius := 200
+	center_x := (PIXEL_X_COUNT / 2)
+	center_y := PIXEL_Y_COUNT / 2
+	for x in 0..<PIXEL_X_COUNT {
+		for y in 0..<PIXEL_Y_COUNT {
+			dx := x - center_x
+			dy := y - center_y
+			if dx*dx + dy*dy <= radius*radius {
+				set_velocity_potential(x, y, 0.0)
+				set_solid(x,y)
+			}
 		}
 	}
 
+	// //centralized square obstacle
+	// obstacle_size := 400
+	// center_x2 := (PIXEL_X_COUNT / 2) - 100
+	// center_y2 := PIXEL_Y_COUNT / 2
+	// for x2 in (center_x2 - obstacle_size/2)..<(center_x2 + obstacle_size/2) {
+	// 	for y2 in (center_y2 - obstacle_size/2)..<(center_y2 + obstacle_size/2) {
+	// 		set_velocity_potential(x2,y2,0.0)
+	// 		set_solid(x2,y2)
+	// 	}
+	// }
+
 	image := rl.GenImageColor(PIXEL_X_COUNT, PIXEL_Y_COUNT, rl.BLANK)
 	texture := rl.LoadTextureFromImage(image)
-	
+	texture_id := texture.id
+
 	pixel_size: i32 = SCREEN_HEIGHT / PIXEL_Y_COUNT
 
 	origin_y := 0 
 	origin_x := (SCREEN_WIDTH - SCREEN_HEIGHT) / 2
-	sim:rawptr = cuda_allocate_mem
-	if sim == nullptr {
+
+	//build 512 color pallete to match behavior of:
+	//hue := (1.0 - Velo_Potential_Data[i]) * 240.0
+	//img_pixels[i] = rl.ColorFromHSV(hue, 1.0, 1.0)
+	palette: [512][4]u8
+
+	for i in 0..<512 {
+		hue:= (1.0 - f32(i)/511.0) * 240.0
+		color := rl.ColorFromHSV(hue, 1.0, 1.0)
+		palette[i][0] = color.r
+		palette[i][1] = color.g
+		palette[i][2] = color.b
+		palette[i][3] = 255
+	}
+
+	sim:rawptr = cuda_allocate_mem(
+		&Velo_Potential_Data[0],
+		&Solid_Data[0],
+		texture_id,
+		&palette[0],
+		PIXEL_X_COUNT,
+		PIXEL_Y_COUNT,
+	)
+	if sim == nil {
 		fmt.println("Failed to allocate CUDA memory.")
 		return
 	}
 	
-	(&Velo_Potential_Data[0], &Solid_Data[0], PIXEL_X_COUNT, PIXEL_Y_COUNT)
 	iterations:int = 0
 	stage := SIM_STAGE.Iterate
 	sim_start_time := time.tick_now()
@@ -131,7 +155,7 @@ main :: proc() {
 			}
 
 			residual := find_residual(Old_Potential_Data, Velo_Potential_Data, PIXEL_X_COUNT*PIXEL_Y_COUNT)
-			if (residual < 1e-15){
+			if (residual < 1e-10){
 				stage = SIM_STAGE.Velocity
 				elapsed_time := time.tick_since(sim_start_time)
 				fmt.printf("Converged after %d iterations in %.2f seconds.", iterations, elapsed_time)
@@ -139,20 +163,20 @@ main :: proc() {
 			}
 
 			/* rendering */
-			img_pixels := mem.slice_ptr((^rl.Color)(image.data), len(Velo_Potential_Data))
+			// img_pixels := mem.slice_ptr((^rl.Color)(image.data), len(Velo_Potential_Data))
 
-			if(stage != SIM_STAGE.Display){
-				for i in 0..<len(Velo_Potential_Data) {
-					if Solid_Data[i] == 1{
-						img_pixels[i] = rl.WHITE
-					}else{
-						hue := (1.0 - Velo_Potential_Data[i]) * 240.0
-						img_pixels[i] = rl.ColorFromHSV(hue, 1.0, 1.0)
-					}
-				}
-			}
+			// if(stage != SIM_STAGE.Display){
+			// 	for i in 0..<len(Velo_Potential_Data) {
+			// 		if Solid_Data[i] == 1{
+			// 			img_pixels[i] = rl.WHITE
+			// 		}else{
+			// 			hue := (1.0 - Velo_Potential_Data[i]) * 240.0
+			// 			img_pixels[i] = rl.ColorFromHSV(hue, 1.0, 1.0)
+			// 		}
+			// 	}
+			// }
 
-			rl.UpdateTexture(texture, image.data)
+			//rl.UpdateTexture(texture, image.data)
 
 			iterations += ITERATIONS_PER_FRAME
 			
